@@ -1,0 +1,974 @@
+---
+title: "Ranking Bad: The Chemistry of Ranked-Choice Voting"
+author: "Mike Cowan"
+format: 
+  html:
+    embed-resources: true
+    df-print: paged
+editor: visual
+---
+
+# 1. Load Packages
+
+```{r}
+library(tidyverse)
+library(broom)
+library(readxl)
+library(marginaleffects)
+library(MASS, exclude = "select")
+library(nnet)
+library(forcats)
+library(lme4)
+library(VGAM)
+
+# Read in the data:
+RCV <- read_xlsx("Ranking Bad - Data (218 responses).xlsx")
+```
+
+# **2. Data Cleaning & Pre-Processing**
+
+-   Drop Non-Consent + Multiple Attention Check Failures;
+
+-   Coalesce the No Label and Label Conditions;
+
+    -   Finds the first non-NA value at each position in a list of vectors; replaces missing values (NA) with available data from other vectors.
+
+-   Where participants have exited out of the survey (meaning they have no answer to the forced-choice questions in the RCV election) we remove the row;
+
+-   Clear Irrelevant Columns;
+
+-   Column name adjustments:
+
+```{r}
+# Data Cleaning & Pre-Processing:
+RCV_1 <- RCV %>%
+  filter(!(Instruction == 2.0 | (pol_eligible == 2 & !is.na(pol_eligible)) | ResponseId %in% c(
+    "R_1EEd3Rpu5x2hdaF", "R_5cSrc7GSPdXjOal", "R_7rweG0PVOt2Wyu5", "R_7YJRDcaHZFrTRCw", "R_5jvuMVh1aX8sria"))) %>%
+  mutate(
+    `asian_NL` = coalesce(RCV_C1_NL_1, RCV_M2_NL_1),
+    `black_NL` = coalesce(RCV_C1_NL_2, RCV_M2_NL_2),
+    `indigenous_NL` = coalesce(RCV_C1_NL_3, RCV_M2_NL_3),
+    `white_NL` = coalesce(RCV_C1_NL_0, RCV_M2_NL_0),
+    `asian_L` = coalesce(RCV_M1_L_1, RCV_C2_L_1),
+    `black_L` = coalesce(RCV_M1_L_2, RCV_C2_L_2),
+    `indigenous_L` = coalesce(RCV_M1_L_3, RCV_C2_L_3),
+    `white_L` = coalesce(RCV_M1_L_0, RCV_C2_L_0)) %>%
+  filter(!is.na(white_NL)) %>%
+  select(-c(StartDate, EndDate, Status, Progress, Finished, RecordedDate, DistributionChannel, UserLanguage, 
+            Gender_4_TEXT, Device_4_TEXT, gc, term, Race_10_TEXT, Education_6_TEXT, pid1_7_TEXT, voteinstr_RCV3_2, 
+            voteinstr_RCV3_1, voteinstr_RCV3_4, voteinstr_RCV3_3, pol_never_vote_7_TEXT, `Race_8_TEXT - Parent Topics`, 
+            'Race_8_TEXT - Topics', `pol_never_vote_7_TEXT - Topics`, `pol_never_vote_7_TEXT - Parent Topics`,
+            `pid1_7_TEXT - Topics`, `pid1_7_TEXT - Parent Topics`, `Education_6_TEXT - Topics`, `Education_6_TEXT - Parent Topics`, 
+            `Race_8_TEXT - Topic Hierarchy Level 1`, `pol_never_vote_7_TEXT - Topic Hierarchy Level 1`, 
+            `pid1_7_TEXT - Topic Hierarchy Level 1`, `Education_6_TEXT - Topic Hierarchy Level 1`)) %>%
+  slice(-1) %>%
+  mutate(`Duration (in seconds)` = as.numeric(`Duration (in seconds)`),
+         completion_time = format(round(`Duration (in seconds)` / 60, 1), nsmall = 1),
+         Consent = Instruction) %>%
+  select(-`Duration (in seconds)`, -Instruction)
+```
+
+# **3. Survey Time Average \~** 15 minutes
+
+-   Analyze survey completion time, identifying outliers and average completion times:
+
+```{r}
+# Analyze Completion Time and Calculate Mean and SD:
+completion_stats <- RCV_1 %>%
+  mutate(completion_time = as.numeric(completion_time)) %>%
+  summarize(
+    mean_completion_time = mean(completion_time, na.rm = TRUE),
+    sd_completion_time = sd(completion_time, na.rm = TRUE)
+  )
+
+# Extract the calculated mean and SD for easy access:
+mean_completion_time <- completion_stats$mean_completion_time
+sd_completion_time <- completion_stats$sd_completion_time
+```
+
+-   Clearly outliers here, so we adjust by capping them (+/-) 4 SD from the mean completion (generally, everyone who opens it up comes back to it within an hour):
+
+```{r}
+# Filter Outliers (+/- 4 SD from the mean) and Recalculate Mean Completion Time:
+new_completion_average <- RCV_1 %>%
+  mutate(completion_time = as.numeric(completion_time)) %>%
+  filter(abs(completion_time - mean_completion_time) <= 4 * sd_completion_time) %>%
+  summarize(new_mean_completion_time = mean(completion_time, na.rm = TRUE))
+
+# Display the new mean completion time:
+new_completion_average
+```
+
+# **4. Demographic Analysi**s
+
+-   Race:
+
+```{r}
+RCV_1
+# Respondent Demographics:
+race_distribution <- RCV_1 %>%
+  mutate(race = gsub("nhs_", "", race)) %>%
+  group_by(race) %>%
+  summarize(count = n())
+race_distribution
+```
+
+-   Bar plot for respondent races:
+
+```{r}
+# Colour scheme:
+my_colors <- c("#1f78b4", "#33a02c", "#e31a1c", "#ff7f00", "#6a3d9a", "#b15928", "#a6cee3", "#fb9a99", "#fdbf6f")
+
+# Labelled bar plot with colour scheme:
+ggplot(race_distribution, aes(x = race, y = count, fill = race)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = my_colors, 
+                    labels = c("Asian", "Black", "Indigenous", "Latino", "Middle Eastern", "Multiracial", "South Asian", "West Asian", "White"), name = "Race") +  # Change legend title +
+  labs(x = NULL, y = "Count", title = "Racial Distribution of Respondents") +
+  theme(axis.text.x = element_blank(),  # Remove x-axis labels
+        plot.title = element_text(hjust = 0.5, face = "bold"))  # Center title and make it bold
+```
+
+**Notes**:
+
+-   Preserve multi-racial.
+-   Comparison group dummy for all identified as non-white (as per original paper).
+
+**Gender**
+
+-   **Note**: Man = 1, Woman = 2, Non-binary = 3
+
+```{r}
+# Identify levels and counts of the Gender variable:
+gender_counts <- RCV_1 %>%
+  count(Gender, name = "Count")
+
+# Print the levels and counts:
+print(gender_counts)
+```
+
+**Age Brackets:**
+
+```{r}
+# Ensure RCV_1$dob is treated as numeric, in case it's not:
+RCV_1$dob <- as.numeric(as.character(RCV_1$dob))
+
+# Map the numeric values to age bracket labels directly:
+age_brackets <- factor(RCV_1$dob, 
+                       levels = 1:6, 
+                       labels = c("18-24", "25-34", "35-44", "45-54", "55-64", "65+"))
+
+# Count the occurrences of each age bracket:
+age_counts <- table(age_brackets)
+
+# Print the counts:
+print(age_counts)
+```
+
+# **5. Analysis Preparation**
+
+### **Overall Average Ranking by Condition (No-Label vs. Label):**
+
+```{r}
+avg_rankings <- RCV_1 %>%
+  # Convert candidate ranking columns to numeric:
+  mutate(across(c(asian_NL, black_NL, indigenous_NL, white_NL, asian_L, black_L, indigenous_L, white_L), as.numeric)) %>%
+  # Then, calculate the mean ranking for each candidate:
+  summarise(
+    asian_NL_avg = mean(asian_NL, na.rm = TRUE),
+    black_NL_avg = mean(black_NL, na.rm = TRUE),
+    indigenous_NL_avg = mean(indigenous_NL, na.rm = TRUE),
+    white_NL_avg = mean(white_NL, na.rm = TRUE),
+    asian_L_avg = mean(asian_L, na.rm = TRUE),
+    black_L_avg = mean(black_L, na.rm = TRUE),
+    indigenous_L_avg = mean(indigenous_L, na.rm = TRUE),
+    white_L_avg = mean(white_L, na.rm = TRUE)
+  )
+avg_rankings
+```
+
+### **Average Ranking of Candidates by Condition for Respondent Racial groups:**
+
+```{r}
+average_rankings_by_race <- RCV_1 %>%
+  # Ensure the candidate ranking columns are numeric:
+  mutate(across(c(asian_NL, black_NL, indigenous_NL, white_NL, asian_L, black_L, indigenous_L, white_L), as.numeric)) %>%
+  # Group by race:
+  group_by(race) %>%
+  # Calculate the mean ranking for each candidate:
+  summarise(
+    asian_NL_avg = mean(asian_NL, na.rm = TRUE),
+    black_NL_avg = mean(black_NL, na.rm = TRUE),
+    indigenous_NL_avg = mean(indigenous_NL, na.rm = TRUE),
+    white_NL_avg = mean(white_NL, na.rm = TRUE),
+    asian_L_avg = mean(asian_L, na.rm = TRUE),
+    black_L_avg = mean(black_L, na.rm = TRUE),
+    indigenous_L_avg = mean(indigenous_L, na.rm = TRUE),
+    white_L_avg = mean(white_L, na.rm = TRUE)
+  )
+average_rankings_by_race
+```
+
+## **Weighting**
+
+To calculate the weights, we divide the target proportion by the survey proportion for each group (survey n=137).
+
+1.  **Weight Calculation Formula**: *Weight = Target Proportion/Survey Proportion*
+
+2.  **Survey Proportion**: *Survey Proportion = Count in Survey/Total Survey Respondents*
+
+### Given the following demographics (Census Canada):
+
++------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Major ethnic     | [White](https://en.wikipedia.org/wiki/White_people) (69.8%)^[\[1\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021newsreleaseB-1)[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^ |
++:=================+:=============================================================================================================================================================================================================================================+
+| **Minor ethnic** | [**South Asian**](https://en.wikipedia.org/wiki/South_Asian_Canadians "South Asian Canadians") **(7.1%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                              |
+|                  | [Indigenous](https://en.wikipedia.org/wiki/Indigenous_peoples_in_Canada "Indigenous peoples in Canada") (5%)^[\[3\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-indigenous2021-3)^\                                      |
+|                  | [Chinese](https://en.wikipedia.org/wiki/Chinese_Canadians "Chinese Canadians") (4.7%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                                |
+|                  | [Black](https://en.wikipedia.org/wiki/Black_Canadians "Black Canadians") (4.3%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                                      |
+|                  | [Filipino](https://en.wikipedia.org/wiki/Filipino_Canadians "Filipino Canadians") (2.6%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                             |
+|                  | [Arab](https://en.wikipedia.org/wiki/Arab_Canadians "Arab Canadians") (1.9%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                                         |
+|                  | [Latin American](https://en.wikipedia.org/wiki/Latin_American_Canadians "Latin American Canadians") (1.6%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                           |
+|                  | [Southeast Asian](https://en.wikipedia.org/wiki/Southeast_Asia "Southeast Asia") (1.1%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                              |
+|                  | [West Asian](https://en.wikipedia.org/wiki/West_Asian_Canadians "West Asian Canadians") (1%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                         |
+|                  | [Korean](https://en.wikipedia.org/wiki/Korean_Canadians "Korean Canadians") (0.6%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                                   |
+|                  | [Japanese](https://en.wikipedia.org/wiki/Japanese_Canadians "Japanese Canadians") (0.3%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^\                                                             |
+|                  | [Multiracial](https://en.wikipedia.org/wiki/Multiracial_people "Multiracial people")/Other, excluding Métis (3.2%)^[\[2\]](https://en.wikipedia.org/wiki/Demographics_of_Canada#cite_note-2021censusA-2)^**                                  |
++------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+### **Manually code target Proportions and Counts**:
+
+```{r}
+# Adjusted Canadian demographics target proportions:
+target_props <- c(
+    nhs_asian = 6.7, # Combining Chinese, Korean, Japanese, and Southeast Asian
+    nhs_black = 4.3,
+    nhs_indigenous = 5,
+    nhs_latino = 1.6,
+    nhs_middleeast = 1.9, # Corresponds to "Arab" from census
+    nhs_multiracial = 3.2,
+    nhs_southasian = 7.1,
+    nhs_westasian = 1,
+    nhs_white = 69.8
+)
+	
+# Survey counts:
+survey_counts <- c(
+    nhs_asian = 15,
+    nhs_black = 5,
+    nhs_indigenous = 1,
+    nhs_latino = 3,
+    nhs_middleeast = 3, # Corresponds to Arab
+    nhs_multiracial = 7,
+    nhs_southasian = 27,
+    nhs_westasian	= 6,
+    nhs_white = 70
+)
+
+# Total survey respondents:
+total_respondents <- sum(survey_counts)
+total_respondents
+
+# Calculate weights:
+weights <- target_props / 100 / (survey_counts / total_respondents)
+weights
+```
+
+-   **Note**: Re-weighting in sampling implies consideration about error bars (cannot be used given the small *n* of some respondent groups). Crowder-Meyer et al. (2023) used individual error bars in AMCE graph.
+
+### Convert weights into dataframe:
+
+```{r}
+# Convert weights into a dataframe:
+weights_df <- data.frame(
+  race = names(weights),
+  weight = unlist(weights))
+
+# Join weights with RCV_3 data:
+RCV_weighted <- RCV_1 %>%
+  left_join(weights_df, by = "race") %>%
+  mutate(across(c(asian_NL, black_NL, indigenous_NL, white_NL, asian_L, black_L, indigenous_L, white_L), as.numeric))
+RCV_weighted
+```
+
+### Mutate to convert Ranking Columns to Numeric:
+
+```{r}
+RCV_weighted_condition <- RCV_weighted %>%
+  mutate(across(c(asian_NL, black_NL, indigenous_NL, white_NL, asian_L, black_L, indigenous_L, white_L), as.numeric))
+RCV_weighted_condition
+```
+
+### **Weighted Rankings per Condition**:
+
+```{r}
+# Calculate Weighted Rankings:
+weighted_rankings <- RCV_weighted_condition %>%
+  summarise(
+    asian_NL_avg = weighted.mean(asian_NL, weight, na.rm = TRUE),
+    black_NL_avg = weighted.mean(black_NL, weight, na.rm = TRUE),
+    indigenous_NL_avg = weighted.mean(indigenous_NL, weight, na.rm = TRUE),
+    white_NL_avg = weighted.mean(white_NL, weight, na.rm = TRUE),
+    asian_L_avg = weighted.mean(asian_L, weight, na.rm = TRUE),
+    black_L_avg = weighted.mean(black_L, weight, na.rm = TRUE),
+    indigenous_L_avg = weighted.mean(indigenous_L, weight, na.rm = TRUE),
+    white_L_avg = weighted.mean(white_L, weight, na.rm = TRUE)
+  )
+weighted_rankings
+```
+
+### New Dataframe with RCV Ranking Results:
+
+```{r}
+# Selecting the RCV preference scores:
+RCV_selected <- RCV_1 %>%
+  select(asian_NL, black_NL, indigenous_NL, white_NL, asian_L, black_L, indigenous_L, white_L)
+RCV_selected
+```
+
+**Ranking Stacked Bar Chart:**
+
+```{r}
+# Assuming RCV_selected is your data frame with rankings
+# We'll first gather the data to convert it from wide to long format
+RCV_long <- RCV_selected %>%
+  gather(key = "group_condition", value = "ranking") %>%
+  filter(!is.na(ranking)) # Remove rows with NA in ranking
+
+# Renaming the factors to be more descriptive
+RCV_long$group_condition <- factor(RCV_long$group_condition, levels = c("white_NL", "white_L", "indigenous_NL", "indigenous_L", "black_NL", "black_L", "asian_NL", "asian_L"),
+                                   labels = c("White (No Label)", "White (Label)", "Indigenous (No Label)", "Indigenous (Label)", "Black (No Label)", "Black (Label)", "Asian (No Label)", "Asian (Label)"))
+
+# Reverse the levels of 'ranking' so that 1 is at the bottom of the stack
+RCV_long$ranking <- factor(RCV_long$ranking, levels = c("4", "3", "2", "1"))
+
+# Calculate the real percentages
+ranking_counts <- RCV_long %>%
+  group_by(group_condition, ranking) %>%
+  summarise(count = n()) %>%
+  mutate(total = sum(count),
+         percentage = count / total * 100)
+
+# Create the vertical stacked bar chart with ggplot2 using the specified color scheme
+ggplot(ranking_counts, aes(x = group_condition, y = percentage, fill = ranking)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%0.1f%%", percentage)), 
+            position = position_stack(vjust = 0.5), 
+            size = 3, 
+            color = "white") + # Text color changed to white
+  scale_fill_manual(values=c("gold", "grey", "orange", "royaLblue"), name="Rank") + # Colors are reversed to match the ranking order
+  labs(title = "RCV Ranking by Candidate Race",
+       x = "Candidates/Condition",
+       y = "Percentage (%)",
+       fill = "Rank") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) # Center and bold the title
+```
+
+# **6. Creating 'Selected' Response Variable (OLS & Logit):**
+
+-   Here we create a "Selected" variable for each race, indicating whether each candidate was the top choice:
+
+```{r}
+# Creates True/False condition (1 = True, else = False);
+# Ensure we are using RCV_weighted as the main dataframe for subsequent operations:
+RCV_main <- RCV_weighted %>%
+  mutate(
+    Selected_asian_NL = as.numeric(asian_NL) == 1,
+    Selected_black_NL = as.numeric(black_NL) == 1,
+    Selected_indigenous_NL = as.numeric(indigenous_NL) == 1,
+    Selected_white_NL = as.numeric(white_NL) == 1,
+    Selected_asian_L = as.numeric(asian_L) == 1,
+    Selected_black_L = as.numeric(black_L) == 1,
+    Selected_indigenous_L = as.numeric(indigenous_L) == 1,
+    Selected_white_L = as.numeric(white_L) == 1
+  )
+RCV_main
+```
+
+### Count all the "Trues":
+
+```{r}
+# Counting 'True' values for each 'Selected_[race]_NL' variable:
+count_selected_asian_NL <- sum(RCV_main$Selected_asian_NL, na.rm = TRUE)
+count_selected_black_NL <- sum(RCV_main$Selected_black_NL, na.rm = TRUE)
+count_selected_indigenous_NL <- sum(RCV_main$Selected_indigenous_NL, na.rm = TRUE)
+count_selected_white_NL <- sum(RCV_main$Selected_white_NL, na.rm = TRUE)
+
+# Print the counts:
+print(paste("Selected Asian NL:", count_selected_asian_NL))
+print(paste("Selected Black NL:", count_selected_black_NL))
+print(paste("Selected Indigenous NL:", count_selected_indigenous_NL))
+print(paste("Selected White NL:", count_selected_white_NL))
+```
+
+```{r}
+# Check the column names to ensure they match the expected pattern:
+names(RCV_main)[grepl("^Selected_", names(RCV_main))]
+```
+
+# **7.0. Convert to Long Format (OLS)**
+
+```{r}
+RCV_long_for_AMCE <- RCV_main %>%
+  pivot_longer(cols = starts_with("Selected_"),
+               names_to = "race_condition",
+               values_to = "selected_first") %>%
+  mutate(
+    # Combine race and condition directly from race_condition:
+    race_condition_combined = gsub("Selected_", "", race_condition),
+    # Ensure the binary outcome is numeric:
+    selected_first = as.numeric(selected_first),
+    # Releveling to make 'white_NL' the reference category:
+    race_condition_combined = factor(race_condition_combined, levels = c("white_NL", "asian_NL", "black_NL", "indigenous_NL", "white_L", "asian_L", "black_L", "indigenous_L"))
+  )
+
+# Adding a 'condition' column based on 'race_condition_combined':
+RCV_long_for_AMCE <- RCV_long_for_AMCE %>%
+  mutate(condition = ifelse(grepl("_NL$", race_condition_combined), "NL", "L"))
+```
+
+# **7.1. Convert to Long Format (Logistic)**
+
+```{r}
+# Creating a long-format dataset for Logistic Regression:
+RCV_long <- RCV_main %>%
+  pivot_longer(
+    cols = starts_with("Selected_"),
+    names_to = "candidate_condition",
+    values_to = "selected"
+  ) %>%
+  mutate(
+    race_condition = sub("^Selected_(.+)_(NL|L)$", "\\1", candidate_condition),
+    condition = sub(".+_(NL|L)$", "\\1", candidate_condition),
+    race_condition = factor(race_condition),
+    condition = factor(condition, levels = c("NL", "L")),
+    selected = as.numeric(selected)
+  ) %>%
+  select(-candidate_condition) %>% 
+  mutate(race_condition = fct_relevel(race_condition, "white"))
+
+RCV_long
+```
+
+# **7.2. Convert to Long Format (Ordinal Logistic)**
+
+```{r}
+# Assuming RCV_main is your dataset after the coalesce operations:
+RCV_long_for_OLR <- RCV_1 %>%
+  pivot_longer(cols = c(asian_NL, black_NL, indigenous_NL, white_NL, asian_L, black_L, indigenous_L, white_L),
+               names_to = "candidate_condition",
+               values_to = "ranking") %>%
+  mutate(
+    # Extract condition (NL or L) from candidate_condition:
+    condition = ifelse(grepl("_L$", candidate_condition), "L", "NL"),
+    # Extract candidate name from candidate_condition:
+    candidate = gsub("_(NL|L)$", "", candidate_condition),
+    candidate = gsub("^(asian|black|indigenous|white)_", "", candidate),
+    # Convert ranking to an ordered factor:
+    ranking = factor(ranking, levels = c("1", "2", "3", "4"), ordered = TRUE)
+  ) %>%
+  select(-candidate_condition) # Optionally remove the candidate_condition column if it's no longer needed.
+
+# Counting the number of observations in 'ranking':
+ranking_counts <- RCV_long_for_OLR %>%
+  count(ranking)
+ranking_counts
+```
+
+# **8. Selection Counts by Race & Condition**
+
+```{r}
+# Correcting the approach to get selection counts by race_condition:
+selection_counts <- RCV_long %>%
+  group_by(race_condition, condition) %>%
+  summarize(count = sum(selected, na.rm = TRUE))
+selection_counts
+```
+
+-   We're introducing a dependence (because as soon as we know one selection is 'True', we know all the others are false).
+
+**Stacked Bar Chart of Selected Counts:**
+
+```{r}
+selection_counts <- data.frame(
+  race_condition = factor(c("white", "white", "asian", "asian", "black", "black", "indigenous", "indigenous")),
+  condition = factor(c("NL", "L", "NL", "L", "NL", "L", "NL", "L"), levels = c("NL", "L")),
+  count = c(50, 21, 29, 38, 19, 40, 39, 35)
+)
+
+# Plotting with ggplot2
+ggplot(selection_counts, aes(x = race_condition, y = count, fill = condition)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Optional: Flips the chart for horizontal bars
+  labs(title = "RCV Rankings by Candidate Race Condition",
+       x = "Race Condition",
+       y = "Count") +
+  scale_fill_brewer(palette = "Pastel1")  # Choose a palette that suits your taste
+
+# Display the plot
+ggsave("stacked_bar_chart.png", width = 10, height = 8)
+
+```
+
+# **9.0. OLS Model for No Label Condition**
+
+```{r}
+# Filter for No Label (NL) condition and run OLS regression:
+RCV_NL <- filter(RCV_long_for_AMCE, condition == "NL")
+OLS_AMCE_NL <- lm(selected_first ~ race_condition_combined, data = RCV_NL)
+summary(OLS_AMCE_NL)
+```
+
+**Graph (No Label & Label):**
+
+```{r}
+# Extract and prepare coefficients for NL condition
+coefficients_NL <- summary(OLS_AMCE_NL)$coefficients[-1, , drop = FALSE] # Exclude the intercept
+coeff_data_NL <- data.frame(
+  race_condition = rownames(coefficients_NL),
+  Estimate = coefficients_NL[, "Estimate"],
+  StdError = coefficients_NL[, "Std. Error"],
+  Condition = "NL"
+)
+
+# Extract and prepare coefficients for L condition
+coefficients_L <- summary(OLS_AMCE_NL)$coefficients[-1, , drop = FALSE] # Exclude the intercept
+coeff_data_L <- data.frame(
+  race_condition = rownames(coefficients_L),
+  Estimate = coefficients_L[, "Estimate"],
+  StdError = coefficients_L[, "Std. Error"],
+  Condition = "L"
+)
+
+# Combine NL and L data
+combined_coeff_data <- rbind(coeff_data_NL, coeff_data_L)
+
+# Adjust race_condition for cleaner presentation
+combined_coeff_data$race_condition <- gsub("(_NL|_L)$", "", combined_coeff_data$race_condition)
+combined_coeff_data$race_condition <- factor(combined_coeff_data$race_condition, levels = unique(combined_coeff_data$race_condition))
+
+# Plotting
+# Adjusted plotting code for horizontal layout +
+# Adjusted plotting code with centered and bold title, centered subtitle
+ggplot(combined_coeff_data, aes(y = race_condition, x = Estimate, color = Condition, group = Condition)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  geom_point(size = 3, aes(shape = Condition)) +
+  geom_errorbarh(aes(xmin = Estimate - StdError, xmax = Estimate + StdError, height = 0.2)) +
+  labs(title = "Difference from White by Condition",
+       subtitle = "Penalization or Advantage in Being Selected First",
+       y = "", # Empty y-axis label
+       x = "",
+       color = "Condition",
+       shape = "Condition") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), # Center and bold the title
+       plot.subtitle = element_text(hjust = 0.5), # Center the subtitle
+        legend.position = "bottom", # Move the legend to the bottom
+        legend.justification = "right", # Justify the legend to the right
+        legend.box.just = "right", # Justify the content of the legend box to the right
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "mm")) + # Adjust legend margin if needed
+  scale_color_manual(values = c("NL" = "#F8766D", "L" = "#00BFC4"), labels = c("NL", "L")) # Manually set colors and order
+```
+
+# **9.1. OLS Model for Label Condition**
+
+```{r}
+# Filter for Label (L) condition:
+RCV_L <- filter(RCV_long_for_AMCE, condition == "L")
+# Run OLS regression:
+OLS_AMCE_L <- lm(selected_first ~ race_condition_combined, data = RCV_L)
+summary(OLS_AMCE_L)
+```
+
+# **10. Weighted OLS Models**
+
+-   For weighted analyses, we now use the same long-format dataset, just specifying weights within the model calls.
+
+## **Weighted OLS Model -- No Label:**
+
+```{r}
+# Weighted OLS for No Label condition:
+OLS_model_NL_weighted <- lm(selected ~ race_condition, data = filter(RCV_long, condition == "NL"), weights = weight)
+summary(OLS_model_NL_weighted)
+```
+
+**Summary**:
+
+-   **Intercept (0.35592)**: Estimated probability of a white candidate being selected as the top choice, (since race_condition 'white' serves as the reference category).
+
+-   **Coefficients for Race Conditions**:
+
+    -   **Asian (-0.16065)**: Being Asian, compared to being white, is associated with a decrease of approximately 16.07 percentage points in the probability of being selected as the top choice.
+
+    -   **Black (-0.22255)**: Being Black, compared to being white, is associated with a decrease of approximately 22.26 percentage points in the probability of being selected as the top choice.
+
+    -   **Indigenous (-0.04047)**: Being Indigenous, compared to being white, is associated with a decrease of approximately 4.05 percentage points in the probability of being selected as the top choice, though this effect is not statistically significant (p \> 0.05).
+
+-   The **adjusted R-squared value (0.03752)** indicates that the model explains approximately 3.75% of the variance in the selection probabilities – suggests that race condition has a small but significant effect on selection.
+
+## **Weighted OLS Model – Label Condition**:
+
+```{r}
+# Weighted OLS for Label condition:
+OLS_model_L_weighted <- lm(selected ~ race_condition, data = filter(RCV_long, condition == "L"), weights = weight)
+summary(OLS_model_L_weighted)
+```
+
+# **11.0. Logistic Regression – No Label**
+
+```{r}
+# Logistic Regression:
+logit.1 <- glm(selected ~ race_condition, data = filter(RCV_long, condition == "NL"),family = binomial(link = "logit"))
+
+summary(logit.1)
+```
+
+**Summary:**
+
+-   **Intercept (-0.5539)**: Log odds of a white candidate being selected as the top choice when all other variables are at their reference levels.
+
+-   **Coefficients for Race Conditions** (log odds):
+
+    -   **Asian (-0.7610)**: Being Asian decreases the log odds of being selected as the top choice by 0.761, compared to being white.
+
+    -   **Black (-1.2724)**: Being Black decreases the log odds of being selected as the top choice by 1.272, compared to being white.
+
+    -   **Indigenous (-0.3675)**: Being Indigenous decreases the log odds of being selected as the top choice by 0.368, compared to being white, though this effect is not statistically significant (p \> 0.05).
+
+-   The **residual deviance (595.20)** compared to the null deviance (616.32) indicates that the model with race conditions fits the data better than the null model -- but still a lot of unexplained variability.
+
+-   **Note**: Create classification table for predicted/actual.
+
+# **11.1. Logistic Regression -- Label**
+
+```{r}
+# Logistic Regression:
+logit.2 <- glm(selected ~ race_condition, data = filter(RCV_long, condition == "L"),family = binomial(link = "logit"))
+
+summary(logit.2)
+```
+
+### Plot Predictions -- No Label:
+
+```{r}
+# Generate predicted probabilities plot:
+logit.1_plot <- plot_predictions(logit.1, condition = "race_condition")
+# Plot:
+plot(logit.1_plot)
+```
+
+### Plot Predictions -- Label:
+
+```{r}
+# Generate predicted probabilities plot:
+logit.2_plot <- plot_predictions(logit.2, condition = "race_condition")
+
+plot(logit.2_plot)
+```
+
+# **12.0. Ordinal Logistic Regression -- No Label**
+
+```{r}
+# Filtering for the NL condition:
+RCV_NL <- RCV_long_for_OLR[RCV_long_for_OLR$condition == "NL",]
+
+# Ensure 'candidate' is a factor and set 'candidatewhite' as the reference:
+RCV_NL$candidate <- factor(RCV_NL$candidate)
+RCV_NL$candidate <- relevel(RCV_NL$candidate, ref = "white")
+
+# Performing OLR for the NL condition:
+OLR_model.1 <- polr(ranking ~ candidate, data = RCV_NL, Hess = TRUE)
+
+# Displaying the summary of the OLR model for the NL condition:
+summary(OLR_model.1)
+```
+
+**Summary**:
+
+The sign of the coefficients reflects the direction of the association between predictor levels and the outcome variable.
+
+-   **Positive coefficient**: Indicates that as the predictor variable increases, the log-odds of being in a higher category of the outcome variable increase. For our purposes -- where a lower rank means higher preference -- a positive coefficient for a group (e.g., black candidates) compared to the reference (e.g., white candidates) suggests that the group is less preferred or more likely to receive a lower preference ranking.
+
+-   **Negative coefficient**: Indicates that as the predictor variable increases, the log-odds of being in a lower category of the outcome variable increase. Thus, a negative coefficient would suggest higher preference.
+
+The positive coefficient for black candidates in the No Label condition suggests they are less preferred compared to white candidates (lower rank number = higher preference; inversely relates to the coefficient's sign).
+
+# **12.1. Ordinal Logistic Regression -- Label**
+
+```{r}
+# Filtering for the L condition:
+RCV_L <- RCV_long_for_OLR[RCV_long_for_OLR$condition == "L",]
+
+# Ensure 'candidate' is a factor and 'candidatewhite' is the reference category:
+RCV_L$candidate <- factor(RCV_L$candidate)
+RCV_L$candidate <- relevel(RCV_L$candidate, ref = "white")
+
+# Performing OLR for the L condition:
+OLR_model.2 <- polr(ranking ~ candidate, data = RCV_L, Hess = TRUE)
+
+# Displaying the summary of the OLR model for the L condition:
+summary(OLR_model.2)
+```
+
+# **13. Multinomial Logistic Regression (Intercept)**
+
+-   **Data preparation**:
+
+```{r}
+# Create the 'top_choice' variable:
+RCV_1
+RCV_1_multi <- RCV_1 %>%
+  rowwise() %>%
+  mutate(
+    top_choice = case_when(
+    asian_NL == "1" ~ "asian_NL",
+    black_NL == "1" ~ "black_NL",
+    indigenous_NL == "1" ~ "indigenous_NL",
+    white_NL == "1" ~ "white_NL",
+  )) %>%
+  ungroup()
+
+# Ensure 'top_choice' is a factor with the correct levels:
+RCV_1_multi$top_choice <- factor(RCV_1_multi$top_choice, levels = c("white_NL", "black_NL", "indigenous_NL", "asian_NL"))
+
+# Now we have a column 'top_choice' indicating which candidate was ranked first by each participant.
+
+# Adjusting RCV_1_multi to include the creation of 'condition' based on 'top_choice' (for later):
+RCV_1_multi <- RCV_1_multi %>%
+  mutate(
+    condition = ifelse(grepl("_NL$", top_choice), "NL", "L"))
+```
+
+-   **Model**:
+
+```{r}
+# Fit the multinomial logistic regression model to analyze the impact of candidates' races on being the top choice:
+multi_model.1 <- multinom(top_choice ~ 1, data = RCV_1_multi)
+
+summary(multi_model.1)
+```
+
+```{r}
+# (ex.) "Black_NL" coefficient:
+coefficient_black <- 0.6443557
+std_error_black <- 0.2694790
+
+# Wald statistic
+wald_statistic_black <- (coefficient_black / std_error_black)^2
+
+# p-value from chi-square distribution with 1 degree of freedom
+p_value_black <- 1 - pchisq(wald_statistic_black, df = 1)
+
+print(p_value_black)
+```
+
+```{r}
+# (ex.) "Indigenous_NL" coefficient:
+coefficient_indigenous <- 0.2484610
+std_error_indigenous <- 0.2136374
+
+# Wald statistic
+wald_statistic_indigenous <- (coefficient_indigenous/ std_error_indigenous)^2
+
+# p-value from chi-square distribution with 1 degree of freedom
+p_value_indigenous <- 1 - pchisq(wald_statistic_indigenous, df = 1)
+
+print(p_value_indigenous)
+```
+
+```{r}
+# (ex.) "Asian_NL" coefficient:
+coefficient_asian <- 0.6443557
+std_error_asian <- 0.2694790
+
+# Wald statistic
+wald_statistic_asian <- (coefficient_asian / std_error_asian)^2
+
+# p-value from chi-square distribution with 1 degree of freedom
+p_value_asian <- 1 - pchisq(wald_statistic_asian, df = 1)
+
+print(p_value_asian)
+```
+
+# **14. Logistic Regression (Race)**
+
+-   Do Whites select Whites in NL condition?
+
+```{r}
+# Create a binary variable indicating whether the participant is white:
+RCV_1_multi <- RCV_1_multi %>%
+  mutate(white_participant = ifelse(race == "nhs_white", 1, 0))
+
+# White participants choosing white candidates in the NL condition:
+RCV_white <- RCV_1_multi %>%
+  filter(condition == "NL") %>%
+  mutate(white_race_selected.1 = if_else(top_choice == "white_NL", 1, 0))
+
+# Logistic regression comparing the likelihood of white participants choosing white candidates to others:
+logit_model_white <- glm(white_race_selected.1 ~ white_participant,
+                          family = binomial(link = "logit"), 
+                          data = RCV_white)
+
+summary(logit_model_white)
+```
+
+-   Do self-identified Conservative Whites select Whites in NL condition?
+
+```{r}
+# Create a binary variable indicating whether the participant is white and conservative:
+RCV_1_multi <- RCV_1_multi %>%
+  mutate(white_conservative = ifelse(race == "nhs_white" & (!is.na(constrong) | ideology %in% c(5, 6, 7)), 1, 0))
+
+# White conservative participants choosing white candidates in the NL condition:
+RCV_white_conservative <- RCV_1_multi %>%
+  filter(condition == "NL") %>%
+  mutate(white_race_selected.2 = if_else(top_choice == "white_NL", 1, 0))
+
+# Logistic regression comparing the likelihood of white conservative participants choosing white candidates to others:
+logit_model_white_conservative <- glm(white_race_selected.2 ~ white_conservative,
+                                      family = binomial(link = "logit"), 
+                                      data = RCV_white_conservative)
+
+summary(logit_model_white_conservative)
+```
+
+-   Do Blacks select Black candidates in NL condition?
+
+```{r}
+# Create a binary variable indicating whether the participant is black:
+RCV_1_multi <- RCV_1_multi %>%
+  mutate(black_participant = ifelse(race == "nhs_black", 1, 0))
+
+# Black participants choosing black candidates in the NL condition:
+RCV_black <- RCV_1_multi %>%
+  filter(condition == "NL") %>%
+  mutate(black_race_selected.1 = if_else(top_choice == "black_NL", 1, 0))
+
+# Logistic regression comparing the likelihood of black participants choosing black candidates to others:
+logit_model_black <- glm(black_race_selected.1 ~ black_participant,
+                          family = binomial(link = "logit"), 
+                          data = RCV_black)
+
+summary(logit_model_black)
+```
+
+-   Do Asians select Asian candidates in NL condition?
+
+```{r}
+# Create a binary variable indicating whether the participant is Asian:
+RCV_1_multi <- RCV_1_multi %>%
+  mutate(asian_participant = ifelse(race == "nhs_asian", 1, 0))
+
+# Asian participants choosing Asian candidates in the NL condition:
+RCV_asian <- RCV_1_multi %>%
+  filter(condition == "NL") %>%
+  mutate(asian_race_selected.1 = if_else(top_choice == "asian_NL", 1, 0))
+
+# Logistic regression comparing the likelihood of Asian participants choosing Asian candidates to others:
+logit_model_asian <- glm(asian_race_selected.1 ~ asian_participant,
+                          family = binomial(link = "logit"), 
+                          data = RCV_asian)
+
+summary(logit_model_asian)
+```
+
+# **15. Negative Partisanship**
+
+```{r}
+RCV_1
+table(RCV_1$pid1)
+```
+
+We need a column for 'participant_ideology':
+
+```{r}
+RCV_1 <- RCV_1 %>%
+  mutate(
+    participant_ideology = case_when(
+      pid1 == 3 ~ "Liberal",
+      pid1 == 4 ~ "Conservative",
+      TRUE ~ NA_character_ # Assign NA for any pid1 that doesn't match 3 or 4
+    ),
+    # Ensure this column exists before creating `negative_partisanship`
+    negative_partisanship = case_when(
+      pid1 == 3 & fourth_ranked_candidate_ideology == "Conservative" ~ 1,
+      pid1 == 4 & fourth_ranked_candidate_ideology == "Liberal" ~ 1,
+      TRUE ~ 0
+    )
+  )
+```
+
+-   We'll use RCV_1 to create a new column for participants' '4th' ranked candidate. Then we'll check if Liberals/Conservatives punish each other via Negative Partisanship:
+
+```{r}
+# Create a new column for the 4th ranked candidate's ideology
+RCV_1 <- RCV_1 %>%
+  mutate(fourth_ranked_candidate_ideology = case_when(
+    asian_L == 4 ~ Candidate1Party,
+    white_L == 4 ~ Candidate2Party,
+    black_L == 4 ~ Candidate3Party,
+    indigenous_L == 4 ~ Candidate4Party
+  ))
+```
+
+-   First, we add a column to indicate instances of negative partisanship -- defined as a participant ranking the opposing major party's candidate as their least preferred (a rank of 4):
+
+```{r}
+# Check ideology of participants (in 'pid1') and the ideology of their 4th ranked candidate. If the Liberal participant ranks a Conservative candidate as 4, or vice versa, it's marked as an instance of negative partisanship:
+RCV_1 <- RCV_1 %>%
+  mutate(negative_partisanship = case_when(
+    pid1 == 3 & fourth_ranked_candidate_ideology == "Conservative" ~ 1,
+    pid1 == 4 & fourth_ranked_candidate_ideology == "Liberal" ~ 1,
+    TRUE ~ 0
+  ))
+```
+
+-   Now we'll summarize how often Liberals and Conservatives engage in Negative Partisanship:
+
+```{r}
+summary_negative_partisanship <- RCV_1 %>%
+  group_by(participant_ideology) %>%
+  summarise(
+    Total = n(),
+    Negative_Partisanship = sum(negative_partisanship),
+    Percentage = (Negative_Partisanship / Total) * 100
+  )
+
+summary_negative_partisanship
+```
+
+-   To statistically compare the rates of Negative Partisanship between Liberals and Conservatives -- directly comparing two proportions here -- it's suitable to use a non-parametric Fisher's Exact Test -- particularly useful for small sample sizes or when the expected frequencies in any of the cells of a contingency table are below 5.
+
+    Given the counts we have:
+
+    -   **Conservatives** with negative partisanship: 10 out of 42
+
+    -   **Liberals** with negative partisanship: 9 out of 42
+
+```{r}
+# Creating a contingency table for the test:
+contingency_table <- matrix(c(10, 32, 9, 33), nrow = 2,
+                            dimnames = list(c("Conservative", "Liberal"),
+                                            c("Negative_Partisanship", "No_Negative_Partisanship")))
+
+# Performing Fisher's Exact Test:
+chi_squared_test_result <- chisq.test(contingency_table)
+
+# Printing the result:
+print(fishers_test_result)
+```
+
+**Summary:**
+
+The result of Fisher's Exact Test for your data indicates the following:
+
+-   **P-value = 1**: This p-value suggests that there is no statistically significant evidence to reject the null hypothesis, which in this context means there is no significant difference between Conservative and Liberal participants in terms of their propensity to engage in negative partisanship, at least as far as the data and statistical power allow to detect.
+
+-   **Odds Ratio ≈ 1.144**: The odds ratio close to 1 further indicates that the likelihood of engaging in negative partisanship is similar between the two groups. The 95% confidence interval for the odds ratio spans from approximately 0.363 to 3.649, which includes 1 (indicating no effect). This wide interval suggests substantial uncertainty about the precise effect size, reflecting either a genuine lack of difference or insufficient data to conclusively detect a difference if it exists.
+
+-   Based on this test, we can conclude that, within the limitations of our sample, there doesn't appear to be a significant difference in the likelihood of engaging in negative partisanship between participants who identify as Conservative and those who identify as Liberal. This could mean several things:
+
+    -   **Similar Levels of Negative Partisanship**: Both groups may indeed engage in negative partisanship at similar rates.
+
+    -   **Insufficient Data**: There might not be enough data to detect a difference if it exists, or the effect size (the difference between groups) is too small to be detected with the sample size we have.

@@ -22,7 +22,7 @@ library(lme4)
 library(VGAM)
 
 # Read in the data:
-RCV <- read_xlsx("Ranking Bad - Data (218 responses).xlsx")
+RCV <- read_xlsx("./01_data/responses.xlsx")
 ```
 
 # **2. Data Cleaning & Pre-Processing**
